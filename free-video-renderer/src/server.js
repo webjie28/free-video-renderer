@@ -1,16 +1,20 @@
 import express from 'express';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
 const PORT = Number(process.env.PORT || 10000);
 const API_KEY = process.env.API_KEY;
-const WIDTH = 720;
-const HEIGHT = 1280;
+// Render's free instances have limited CPU. This is still a vertical Shorts
+// format, but substantially faster to encode than 720x1280.
+const WIDTH = 480;
+const HEIGHT = 854;
+const jobs = new Map();
 
 function run(command, args) {
   return new Promise((resolve, reject) => {
@@ -95,19 +99,50 @@ async function makeScene(folder, scene, index) {
   await run('ffmpeg', [
     '-y', '-stream_loop', '-1', '-i', video, '-i', audio,
     '-t', String(duration), '-map', '0:v:0', '-map', '1:a:0',
-    '-vf', filters.join(','), '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '24',
-    '-c:a', 'aac', '-b:a', '128k', '-shortest', output,
+    '-vf', filters.join(','), '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
+    '-c:a', 'aac', '-b:a', '96k', '-shortest', output,
   ]);
   return output;
 }
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-app.post('/render', async (req, res) => {
+function authenticated(req, res) {
+  if (!API_KEY || req.get('authorization') !== `Bearer ${API_KEY}`) {
+    res.status(401).json({ error: 'Missing or invalid API key' });
+    return false;
+  }
+  return true;
+}
+
+async function renderJob(job) {
   try {
-    if (!API_KEY || req.get('authorization') !== `Bearer ${API_KEY}`) {
-      return res.status(401).json({ error: 'Missing or invalid API key' });
+    job.status = 'processing';
+    console.log(`Render ${job.id}: processing ${job.scenes.length} scenes`);
+    const folder = await mkdtemp(path.join(tmpdir(), 'video-render-'));
+    job.folder = folder;
+    const sceneFiles = [];
+    for (let index = 0; index < job.scenes.length; index += 1) {
+      console.log(`Render ${job.id}: scene ${index + 1}/${job.scenes.length}`);
+      sceneFiles.push(await makeScene(folder, job.scenes[index], index + 1));
     }
+    const list = path.join(folder, 'concat.txt');
+    job.output = path.join(folder, 'final.mp4');
+    await writeFile(list, sceneFiles.map((file) => `file '${file.replace(/'/g, "'\\''")}'`).join('\n'));
+    await run('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', list, '-c', 'copy', '-movflags', '+faststart', job.output]);
+    job.status = 'completed';
+    job.completedAt = Date.now();
+    console.log(`Render ${job.id}: completed`);
+  } catch (error) {
+    console.error(error);
+    job.status = 'failed';
+    job.error = error instanceof Error ? error.message : 'Render failed';
+  }
+}
+
+app.post('/render', async (req, res) => {
+  if (!authenticated(req, res)) return;
+  try {
     const scenes = req.body?.scenes;
     if (!Array.isArray(scenes) || scenes.length < 1 || scenes.length > 4) {
       return res.status(400).json({ error: 'scenes must contain between 1 and 4 items' });
@@ -116,22 +151,36 @@ app.post('/render', async (req, res) => {
       validateUrl(scene?.video_url, `scenes[${index}].video_url`);
       validateUrl(scene?.audio_url, `scenes[${index}].audio_url`);
     }
-    const folder = await mkdtemp(path.join(tmpdir(), 'video-render-'));
-    try {
-      const sceneFiles = [];
-      for (let index = 0; index < scenes.length; index += 1) sceneFiles.push(await makeScene(folder, scenes[index], index + 1));
-      const list = path.join(folder, 'concat.txt');
-      const output = path.join(folder, 'final.mp4');
-      await writeFile(list, sceneFiles.map((file) => `file '${file.replace(/'/g, "'\\''")}'`).join('\n'));
-      await run('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', list, '-c', 'copy', '-movflags', '+faststart', output]);
-      const video = await readFile(output);
-      res.type('video/mp4').set('Content-Disposition', 'attachment; filename="short.mp4"').send(video);
-    } finally {
-      await rm(folder, { recursive: true, force: true });
-    }
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: error instanceof Error ? error.message : 'Render failed' });
+   const id = randomUUID();
+    const job = { id, scenes, status: 'queued', createdAt: Date.now(), folder: null, output: null, error: null };
+    jobs.set(id, job);
+    void renderJob(job);
+    return res.status(202).json({ id, status: job.status });
+    } catch (error) {
+    return res.status(400).json({
+      error: error instanceof Error ? error.message : 'Invalid render request',
+    });
+  }
+});
+app.get('/render/:id', (req, res) => {
+  if (!authenticated(req, res)) return;
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: 'Render job not found' });
+  return res.json({ id: job.id, status: job.status, error: job.error });
+});
+
+app.get('/render/:id/download', (req, res) => {
+  if (!authenticated(req, res)) return;
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: 'Render job not found' });
+  if (job.status === 'failed') return res.status(422).json({ error: job.error });
+  if (job.status !== 'completed' || !job.output) return res.status(409).json({ error: 'Render is not ready yet' });
+  return res.type('video/mp4').set('Content-Disposition', 'attachment; filename="short.mp4"').sendFile(job.output, (error) => {
+    if (error) console.error(`Render ${job.id}: download failed`, error);
+    setTimeout(async () => {
+      jobs.delete(job.id);
+      if (job.folder) await rm(job.folder, { recursive: true, force: true });
+    }, 10 * 60 * 1000).unref();
   }
 });
 
