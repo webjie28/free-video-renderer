@@ -151,17 +151,16 @@ app.post('/render', async (req, res) => {
       validateUrl(scene?.video_url, `scenes[${index}].video_url`);
       validateUrl(scene?.audio_url, `scenes[${index}].audio_url`);
     }
-   const id = randomUUID();
+    const id = randomUUID();
     const job = { id, scenes, status: 'queued', createdAt: Date.now(), folder: null, output: null, error: null };
     jobs.set(id, job);
     void renderJob(job);
     return res.status(202).json({ id, status: job.status });
-    } catch (error) {
-    return res.status(400).json({
-      error: error instanceof Error ? error.message : 'Invalid render request',
-    });
+  } catch (error) {
+    return res.status(400).json({ error: error instanceof Error ? error.message : 'Invalid render request' });
   }
 });
+
 app.get('/render/:id', (req, res) => {
   if (!authenticated(req, res)) return;
   const job = jobs.get(req.params.id);
@@ -184,4 +183,6 @@ app.get('/render/:id/download', (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`Free video renderer listening on ${PORT}`));
+// Explicitly bind to every network interface so Render's health/port scanner
+// can reach this Docker web service.
+app.listen(PORT, '0.0.0.0', () => console.log(`Free video renderer listening on ${PORT}`));
