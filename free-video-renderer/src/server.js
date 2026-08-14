@@ -193,7 +193,7 @@ app.get('/render/:id/download', (req, res) => {
       jobs.delete(job.id);
       if (job.folder) await rm(job.folder, { recursive: true, force: true });
     }, 10 * 60 * 1000).unref();
-  }
+  });
 });
 
 // Explicitly bind to every network interface so Render's health/port scanner
