@@ -77,6 +77,19 @@ function srtTime(seconds) {
   return `${hours}:${minutes}:${secs},${ms}`;
 }
 
+function makeCaptionCues(caption, duration) {
+  // Display only a short, readable phrase at a time instead of the whole
+  // narration. This keeps the subtitle in the middle without covering the
+  // entire Short.
+  const words = caption.match(/\S+/g) || [];
+  const phrases = [];
+  for (let index = 0; index < words.length; index += 4) {
+    phrases.push(words.slice(index, index + 4).join(' '));
+  }
+  const secondsPerPhrase = duration / Math.max(phrases.length, 1);
+  return phrases.map((phrase, index) => `${index + 1}\n${srtTime(index * secondsPerPhrase)} --> ${srtTime(Math.min(duration, (index + 1) * secondsPerPhrase))}\n${phrase}\n`).join('\n');
+}
+
 async function makeScene(folder, scene, index) {
   const video = path.join(folder, `video-${index}.mp4`);
   const audio = path.join(folder, `audio-${index}.mp3`);
@@ -86,7 +99,7 @@ async function makeScene(folder, scene, index) {
   await download(scene.audio_url, audio);
   const duration = await audioDuration(audio);
   const caption = String(scene.caption || '').replace(/\r?\n/g, ' ').trim();
-  await writeFile(subtitles, caption ? `1\n00:00:00,000 --> ${srtTime(duration)}\n${caption}\n` : '');
+  await writeFile(subtitles, caption ? makeCaptionCues(caption, duration) : '');
   const filters = [
     `scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase`,
     `crop=${WIDTH}:${HEIGHT}`,
@@ -94,7 +107,7 @@ async function makeScene(folder, scene, index) {
     'format=yuv420p',
   ];
   if (caption) {
-    filters.push(`subtitles=${subtitles}:force_style='FontName=DejaVu Sans,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,Alignment=2,MarginV=100'`);
+    filters.push(`subtitles=${subtitles}:force_style='FontName=DejaVu Sans,FontSize=18,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Alignment=5,MarginV=0'`);
   }
   await run('ffmpeg', [
     '-y', '-stream_loop', '-1', '-i', video, '-i', audio,
@@ -180,7 +193,7 @@ app.get('/render/:id/download', (req, res) => {
       jobs.delete(job.id);
       if (job.folder) await rm(job.folder, { recursive: true, force: true });
     }, 10 * 60 * 1000).unref();
-  });
+  }
 });
 
 // Explicitly bind to every network interface so Render's health/port scanner
