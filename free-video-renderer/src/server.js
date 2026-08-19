@@ -178,6 +178,72 @@ function makeCaptionCues(caption, duration) {
   ].join('\n');
 }
 
+function normalizeHookText(value) {
+  return String(value || '')
+    .replace(/\r?\n/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 90);
+}
+
+function wrapHookText(text, maxLineLength = 18, maxLines = 3) {
+  const words = String(text || '').match(/\S+/g) || [];
+  const lines = [];
+  let line = '';
+
+  for (const word of words) {
+    const candidate = line ? line + ' ' + word : word;
+    if (candidate.length > maxLineLength && line) {
+      lines.push(line);
+      line = word;
+      if (lines.length === maxLines - 1) break;
+    } else {
+      line = candidate;
+    }
+  }
+
+  if (line && lines.length < maxLines) lines.push(line);
+  return lines.join('\n') || 'AUTOMATION TIP';
+}
+
+function escapeFilterPath(value) {
+  return String(value)
+    .replace(/\\/g, '\\\\')
+    .replace(/:/g, '\\:')
+    .replace(/'/g, "\\'");
+}
+
+async function makeHook(folder, hookText) {
+  const source = path.join(folder, 'video-1.mp4');
+  const textFile = path.join(folder, 'hook-text.txt');
+  const output = path.join(folder, 'hook.mp4');
+  const fontFile = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
+
+  await writeFile(textFile, wrapHookText(hookText), 'utf8');
+
+  const filters = [
+    'scale=' + WIDTH + ':' + HEIGHT + ':force_original_aspect_ratio=increase',
+    'crop=' + WIDTH + ':' + HEIGHT,
+    'setsar=1',
+    'format=yuv420p',
+    'eq=brightness=-0.18:contrast=1.10',
+    'drawbox=x=0:y=0:w=iw:h=ih:color=black@0.30:t=fill',
+    'drawtext=fontfile=' + escapeFilterPath(fontFile) + ':textfile=' + escapeFilterPath(textFile) + ':fontcolor=white:fontsize=38:line_spacing=10:x=(w-text_w)/2:y=(h-text_h)/2:box=1:boxcolor=black@0.55:boxborderw=18',
+    "drawtext=fontfile=" + escapeFilterPath(fontFile) + ":text='NEGOSYO NAKA-AUTO':fontcolor=0x2FE6A6:fontsize=16:x=(w-text_w)/2:y=90:box=1:boxcolor=black@0.35:boxborderw=8",
+  ];
+
+  await run('ffmpeg', [
+    '-y', '-stream_loop', '-1', '-i', source,
+    '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+    '-t', '0.9', '-map', '0:v:0', '-map', '1:a:0',
+    '-vf', filters.join(','),
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
+    '-c:a', 'aac', '-b:a', '96k', '-shortest', output,
+  ]);
+
+  return output;
+}
+
 async function makeScene(folder, scene, index) {
   const video = path.join(folder, `video-${index}.mp4`);
   const audio = path.join(folder, `audio-${index}.mp3`);
@@ -270,6 +336,11 @@ async function renderJob(job) {
       );
     }
 
+    if (job.hookText) {
+      console.log(`Render ${job.id}: adding topic hook card`);
+      sceneFiles.unshift(await makeHook(folder, job.hookText));
+    }
+
     const list = path.join(folder, 'concat.txt');
     job.output = path.join(folder, 'final.mp4');
 
@@ -288,8 +359,16 @@ async function renderJob(job) {
       '0',
       '-i',
       list,
-      '-c',
-      'copy',
+      '-c:v',
+      'libx264',
+      '-preset',
+      'veryfast',
+      '-crf',
+      '23',
+      '-c:a',
+      'aac',
+      '-b:a',
+      '128k',
       '-movflags',
       '+faststart',
       job.output,
@@ -309,6 +388,7 @@ app.post('/render', async (req, res) => {
   if (!authenticated(req, res)) return;
 
   try {
+    const hookText = normalizeHookText(req.body?.hook_text);
     const scenes = req.body?.scenes;
 
     if (!Array.isArray(scenes) || scenes.length < 1 || scenes.length > 4) {
@@ -327,6 +407,7 @@ app.post('/render', async (req, res) => {
     const job = {
       id,
       scenes,
+      hookText,
       status: 'queued',
       createdAt: Date.now(),
       folder: null,
@@ -337,7 +418,7 @@ app.post('/render', async (req, res) => {
     jobs.set(id, job);
     void renderJob(job);
 
-    return res.status(202).json({ id, status: job.status });
+    return res.status(202).json({ id, status: job.status, hook_applied: Boolean(job.hookText) });
   } catch (error) {
     return res.status(400).json({
       error: error instanceof Error ? error.message : 'Invalid render request',
@@ -357,6 +438,7 @@ app.get('/render/:id', (req, res) => {
   return res.json({
     id: job.id,
     status: job.status,
+    hook_applied: Boolean(job.hookText),
     error: job.error,
   });
 });
@@ -399,3 +481,4 @@ app.get('/render/:id/download', (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Free video renderer listening on ${PORT}`);
 });
+
